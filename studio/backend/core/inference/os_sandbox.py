@@ -1292,6 +1292,46 @@ def _software_launch(plan: ToolLaunchPlan, record: ToolExecutionRecord) -> Prepa
     )
 
 
+def _tenki_launch(plan: ToolLaunchPlan) -> PreparedSandboxLaunch | None:
+    """Opt-in remote VM (UNSLOTH_TENKI_SANDBOX=1); None leaves the local backends exactly as they were."""
+    from . import sandbox_tenki
+
+    if not sandbox_tenki.enabled():
+        return None
+    available, reason = sandbox_tenki.available()
+    if not available:
+        if plan.requested_mode == "required":
+            raise SandboxUnavailableError(
+                f"TENKI_SANDBOX_UNAVAILABLE: {reason}",
+                remediation = f"Fix it, or unset {sandbox_tenki.ENABLE_ENV} to use local isolation.",
+            )
+        logger.warning("Tenki sandbox requested but unavailable (%s); using local isolation", reason)
+        return None
+    prepared = sandbox_tenki.prepare(plan)
+    prepared.execution_record = ToolExecutionRecord(
+        requested_mode = plan.requested_mode,
+        effective_mode = "remote_vm",
+        environment = "tenki",
+        backend = sandbox_tenki.BACKEND_NAME,
+        profile_id = sandbox_tenki.PROFILE_ID,
+        probe_generation = "",
+        # The tool never runs on this host; the host side is the relay alone.
+        os_isolation = True,
+        retained_safeguards = tuple(
+            item
+            for item in _OS_ISOLATION_SAFEGUARDS
+            if item != "timeout" or plan.timeout_seconds is not None
+        ),
+        limitations = sandbox_tenki.limitations(),
+        network_policy = (
+            "allowlist"
+            if sandbox_tenki.allow_outbound() and sandbox_tenki.allowed_domains()
+            else ("unrestricted" if sandbox_tenki.allow_outbound() else "none")
+        ),
+    )
+    return prepared
+
+
 def prepare_tool_launch(plan: ToolLaunchPlan) -> PreparedSandboxLaunch:
     """Unavailable hosts fall back in auto; unsafe workdirs and build failures refuse."""
     if plan.cancel_event is not None and plan.cancel_event.is_set():
@@ -1346,6 +1386,10 @@ def prepare_tool_launch(plan: ToolLaunchPlan) -> PreparedSandboxLaunch:
                 limitations = _software_only_limitations(),
             ),
         )
+
+    tenki = _tenki_launch(plan)
+    if tenki is not None:
+        return tenki
 
     # Taken before the check: a reset while it runs must not be undone by this launch's answer.
     generation = tool_isolation_generation()
